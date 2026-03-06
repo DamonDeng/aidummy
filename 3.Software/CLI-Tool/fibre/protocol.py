@@ -254,6 +254,9 @@ class Channel(PacketSink):
                         error_ctr -= 1
                     # Process response
                     # This should not throw an exception, otherwise the channel breaks
+                    # Guard against spurious short packets (e.g. USB ZLPs on init)
+                    if len(response) < 2:
+                        continue
                     self.process_packet(response)
                 #print("receiver thread is exiting")
             except Exception:

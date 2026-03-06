@@ -140,3 +140,82 @@ Do NOT use these commands unless you know exactly what you're doing:
 - `joint_X.set_position()` — raw motor command, no velocity limit
 - `joint_X.set_velocity()` — raw motor command, continuous rotation
 - `joint_X.set_current()` — raw current control
+
+---
+
+## Starting the HTTP Server
+
+**Always launch in background — never block your session!**
+
+```bash
+# Start server (background, logs to file)
+cd ~/Desktop/workspace/aidummy/3.Software/robot-server
+python3 robot_server.py > /tmp/robot_server.log 2>&1 &
+
+# Check connection status (poll separately)
+tail -f /tmp/robot_server.log
+# or one-shot:
+cat /tmp/robot_server.log
+```
+
+The server takes up to ~90 seconds to connect (USB Fibre JSON enumeration is slow).
+Wait for `Application startup complete` in the log before calling any endpoints.
+
+To check if it's already running:
+```bash
+pgrep -f robot_server.py
+```
+
+To stop it:
+```bash
+pkill -f robot_server.py
+```
+
+---
+
+## Working Modes
+
+### 🏗️ Building Mode (DEFAULT)
+- Think carefully, explain steps, document decisions
+- Good for: adding features, debugging, writing code, discussing options
+- Activated by: "building mode" or "switch to building mode" or just default state
+
+### 🏃 Running Mode
+- Fast execution, no explanations, minimal text
+- After each arm action: take a photo and send it via Feishu API (direct, not message tool)
+- Response format: just confirm the command was sent, then post the photo
+- Good for: live control, demo, exploring movements
+- Activated by: "running mode" or "switch to running mode"
+
+### Switching
+User says "running mode" → switch immediately, acknowledge briefly
+User says "building mode" → switch back, resume detailed responses
+Current mode should be tracked in session context.
+
+---
+
+## Chinese Nickname & Auto Mode Switch
+
+- Chinese nickname: **螳螂虾** (Mantis Shrimp = Squilla)
+- If a message is in Chinese AND starts with **螳螂虾** → immediately switch to **Running Mode**
+- Stay in Running Mode until explicitly told to switch back (no auto-revert)
+- Example trigger: "螳螂虾，把手臂抬高一点" → Running Mode, execute, photo, done
+
+---
+
+## ⚠️ Safety Rules
+
+### J1 (Base Rotation) — SAFE RANGE CONFIRMED ✅
+Tested incrementally 2026-03-06. Both directions verified clear up to ±90°.
+**Approved operating range: J1 = -45° to +45°** (conservative limit, set by Damon)
+Do not exceed ±45° without explicit re-approval.
+
+### Joint Limits (hard limits enforced by move_j)
+| Joint | Min (°) | Max (°) | Notes |
+|-------|---------|---------|-------|
+| J1 | -45 | 45 | ✅ Tested to ±90°, operating limit set to ±45° |
+| J2 | -73 | 90 | |
+| J3 | 35 | 180 | |
+| J4 | -180 | 180 | |
+| J5 | -120 | 120 | |
+| J6 | -720 | 720 | |

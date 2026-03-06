@@ -46,8 +46,12 @@ class USBBulkTransport(fibre.protocol.PacketSource, fibre.protocol.PacketSink):
     # to epr.read() does not return these packet until a new packet arrives.
     # This undesirable queue can be cleared by resetting the device.
     # On windows this would cause file-not-found errors in subsequent dev calls
-    if platform.system() != 'Windows':
-        self.dev.reset()
+    # Skip USB reset: on macOS (Darwin) the reset causes STM32 CDC devices
+    # to permanently disconnect rather than re-enumerate. Safe to skip entirely
+    # since the fibre protocol handshake verifies the device anyway.
+    if platform.system() == 'Windows':
+        pass  # Windows also skipped per original logic; nothing to do
+
 
     #self.dev.set_configuration() # no args: set first configuration
 
