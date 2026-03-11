@@ -1401,6 +1401,7 @@ async def stream_angles(ws: WebSocket):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Camera endpoints — Orbbec Astra Pro (RGB + Depth)
+# Phase 2: ctypes persistent driver (~30ms/frame after first open)
 # ══════════════════════════════════════════════════════════════════════════════
 
 try:
@@ -1417,13 +1418,11 @@ def _get_camera() -> "CameraManager":
 
 
 @app.get("/camera/rgb", tags=["Camera"],
-         summary="Capture RGB frame (JPEG)",
-         response_description="JPEG image from Astra Pro HD Camera")
+         summary="Capture RGB frame (JPEG)")
 async def camera_rgb(warmup: float = 2.0):
     """
-    Capture a single RGB frame from the Astra Pro HD Camera.
-    Returns JPEG image bytes.
-    Query param `warmup`: seconds for camera warm-up (default 2.0).
+    Capture RGB frame from Astra Pro HD Camera (UVC).
+    Returns JPEG. Query param `warmup`: seconds for auto-exposure (default 2.0).
     """
     import asyncio
     cm = _get_camera()
@@ -1437,13 +1436,13 @@ async def camera_rgb(warmup: float = 2.0):
 
 
 @app.get("/camera/depth", tags=["Camera"],
-         summary="Capture depth frame (PNG)",
-         response_description="Colorized depth PNG — red=close, blue=far")
+         summary="Capture depth frame (PNG, ~30ms with persistent driver)")
 async def camera_depth(width: int = 640, height: int = 480, fps: int = 30):
     """
-    Capture a depth frame from the Astra Pro depth sensor.
-    Returns a colorized PNG image (red = close, blue = far).
-    Supported resolutions: 160×120, 320×240, 640×480 @ 30fps | 1280×1024 @ 7fps.
+    Capture depth frame via ctypes persistent driver.
+    Returns colorized PNG (red=close, blue=far, auto p5-p95 range).
+    Resolutions: 160×120, 320×240, 640×480 @ 30fps | 1280×1024 @ 7fps.
+    First call ~0.5s (device open); subsequent calls ~30ms.
     """
     import asyncio
     cm = _get_camera()
@@ -1452,20 +1451,17 @@ async def camera_depth(width: int = 640, height: int = 480, fps: int = 30):
             None, lambda: cm.depth.capture_bytes(width, height, fps)
         )
         return Response(content=data, media_type="image/png")
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/camera/depth/hires", tags=["Camera"],
-         summary="Capture hi-res depth frame 1280×1024 (PNG)",
-         response_description="Colorized depth PNG at 1280×1024 — red=close, blue=far")
+         summary="Capture hi-res depth frame 1280×1024 (PNG)")
 async def camera_depth_hires():
     """
-    Capture a high-resolution depth frame (1280×1024 @ 7fps).
-    4× more detail than default 640×480. Takes ~3–4 seconds.
-    Returns colorized PNG (red = close, blue = far).
+    Capture 1280×1024 depth frame @ 7fps.
+    4× more pixels than 640×480. ~30ms capture after device open.
+    Returns colorized PNG.
     """
     import asyncio
     cm = _get_camera()
@@ -1474,48 +1470,36 @@ async def camera_depth_hires():
             None, cm.depth.capture_hires_bytes
         )
         return Response(content=data, media_type="image/png")
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/camera/depth/stats", tags=["Camera"],
-         summary="Depth frame stats (JSON only, no image)")
+         summary="Depth frame stats JSON only (~3ms, no PNG encoding)")
 async def camera_depth_stats(width: int = 640, height: int = 480, fps: int = 30):
     """
-    Capture a depth frame and return statistics as JSON.
-    No image returned — faster than /camera/depth when you only need numbers.
+    Capture depth frame and return stats as JSON. No PNG encoding.
+    Extremely fast (~3ms) when device is already open.
     Returns: width, height, valid_pixels, valid_pct, depth_min/max/p5/p95/mean in mm.
     """
-    import asyncio, tempfile, os
+    import asyncio
     cm = _get_camera()
     try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            tmp = f.name
-        try:
-            stats = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: cm.depth.capture(tmp, width, height, fps)
-            )
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        stats = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: cm.depth.capture_stats(width, height, fps)
+        )
         return stats
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/camera/snapshot", tags=["Camera"],
-         summary="Capture RGB + depth simultaneously")
+         summary="Capture RGB + depth simultaneously, return JSON")
 async def camera_snapshot():
     """
-    Capture RGB and depth frames in parallel.
+    Capture RGB and depth in parallel.
     Saves to /tmp/snapshot_rgb.jpg and /tmp/snapshot_depth.png.
-    Returns JSON with file paths, depth stats, and timestamp.
+    Returns JSON with paths, depth stats, and UTC timestamp.
     """
     import asyncio
     from datetime import datetime, timezone
@@ -1532,14 +1516,14 @@ async def camera_snapshot():
 
     async def capture_depth():
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, lambda: cm.depth.capture(depth_path, 640, 480, 30)
+        png_bytes, stats = await loop.run_in_executor(
+            None, lambda: cm.depth.capture_bytes(640, 480, 30)
         )
+        Path(depth_path).write_bytes(png_bytes)
+        return stats
 
     try:
         rgb_ok, depth_stats = await asyncio.gather(capture_rgb(), capture_depth())
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1551,6 +1535,86 @@ async def camera_snapshot():
         "depth_stats": depth_stats,
         "timestamp":   datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.websocket("/camera/stream", name="Depth stream WebSocket")
+async def camera_stream(websocket: WebSocket):
+    """
+    WebSocket depth frame stream.
+
+    Connect to ws://127.0.0.1:3001/camera/stream
+    Optionally send a JSON config message first:
+        {"width": 640, "height": 480, "fps": 30, "format": "png"|"stats", "interval_ms": 100}
+
+    Server pushes frames at requested interval:
+    - format "png"  → binary PNG frame
+    - format "stats" → JSON text with depth stats
+
+    Send {"stop": true} to close gracefully.
+    """
+    import asyncio
+    import json as _json
+
+    await websocket.accept()
+    cm = _get_camera()
+
+    # Defaults
+    width       = 640
+    height      = 480
+    fps         = 30
+    fmt         = "png"     # "png" or "stats"
+    interval_ms = 100       # ms between frames
+
+    # Optional config from client
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+        cfg = _json.loads(raw)
+        width       = cfg.get("width",       width)
+        height      = cfg.get("height",      height)
+        fps         = cfg.get("fps",         fps)
+        fmt         = cfg.get("format",      fmt)
+        interval_ms = cfg.get("interval_ms", interval_ms)
+    except (asyncio.TimeoutError, Exception):
+        pass  # no config sent — use defaults
+
+    loop = asyncio.get_event_loop()
+    try:
+        while True:
+            t0 = loop.time()
+
+            try:
+                if fmt == "stats":
+                    stats = await loop.run_in_executor(
+                        None, lambda: cm.depth.capture_stats(width, height, fps)
+                    )
+                    await websocket.send_text(_json.dumps(stats))
+                else:
+                    png_bytes, _ = await loop.run_in_executor(
+                        None, lambda: cm.depth.capture_bytes(width, height, fps)
+                    )
+                    await websocket.send_bytes(png_bytes)
+            except Exception as e:
+                await websocket.send_text(_json.dumps({"error": str(e)}))
+                break
+
+            # Throttle to requested interval
+            elapsed_ms = (loop.time() - t0) * 1000
+            wait_ms    = max(0, interval_ms - elapsed_ms)
+            if wait_ms > 0:
+                await asyncio.sleep(wait_ms / 1000.0)
+
+            # Check for stop message (non-blocking)
+            try:
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
+                if _json.loads(msg).get("stop"):
+                    break
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await websocket.close()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
