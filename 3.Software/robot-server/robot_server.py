@@ -1617,6 +1617,127 @@ async def camera_stream(websocket: WebSocket):
         await websocket.close()
 
 
+@app.get("/camera/depth/raw", tags=["Camera"],
+         summary="Raw depth frame as uint16 binary (numpy-compatible)")
+async def camera_depth_raw(width: int = 640, height: int = 480, fps: int = 30):
+    """
+    Return raw uint16 depth values as binary blob.
+    First 8 bytes: [width(int32), height(int32)] as little-endian.
+    Remaining bytes: H×W uint16 values in mm (row-major).
+    Also sets X-Depth-Scale header = mm per unit (always 1.0 for Astra Pro).
+    """
+    import asyncio, struct
+    import numpy as np
+    cm = _get_camera()
+    try:
+        raw, W, H, scale = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: cm.depth.capture_raw(width, height, fps)
+        )
+        header = struct.pack('<ii', int(W), int(H))
+        data = header + raw.astype('<u2').tobytes()
+        return Response(content=data, media_type="application/octet-stream",
+                        headers={"X-Depth-Scale": str(scale),
+                                 "X-Depth-Width": str(W),
+                                 "X-Depth-Height": str(H)})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/camera/objects/detect", tags=["Camera"],
+         summary="Detect elevated objects on the desk (JSON)")
+async def camera_objects_detect(
+    elevation_thresh_mm: float = 20.0,
+    min_blob_pixels: int = 100,
+    width: int = 640, height: int = 480
+):
+    """
+    Detect 3D-printed objects on the desk using depth camera.
+
+    Algorithm:
+    1. Capture depth frame
+    2. Estimate desk plane depth (p85 of valid pixels = background desk)
+    3. Find pixels significantly closer than desk = elevated objects
+    4. Label connected blobs, filter by size
+    5. Return each blob's 3D centroid in camera frame + pixel location
+
+    Returns JSON list of detected objects with:
+      - id, pixels, center_uv, depth_mm, elevation_mm, cam_3d_mm [x,y,z]
+    """
+    import asyncio
+    import numpy as np
+    from scipy import ndimage as ndi
+
+    cm = _get_camera()
+    try:
+        raw, W, H, scale = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: cm.depth.capture_raw(width, height, fps=30)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    frame = raw.reshape(H, W).astype(float) * scale
+
+    # Intrinsics
+    fx = fy = 570.34; cx, cy = W / 2.0 - 0.5, H / 2.0 - 0.5
+
+    # Valid pixels (ignore sensor artifacts at very close range)
+    valid = (frame > 100) & (frame < 1000)
+    if valid.sum() < 1000:
+        return {"ok": False, "detail": "insufficient valid depth pixels", "objects": []}
+
+    # Desk plane: the dominant far surface (p85 of valid pixels)
+    valid_depths = frame[valid]
+    desk_depth = float(np.percentile(valid_depths, 85))
+
+    # Object pixels: elevated above desk by threshold
+    obj_mask = valid & (frame < (desk_depth - elevation_thresh_mm))
+
+    if obj_mask.sum() < min_blob_pixels:
+        return {"ok": True, "desk_depth_mm": round(desk_depth, 1),
+                "n_objects": 0, "objects": [],
+                "note": f"No objects found above desk (thresh={elevation_thresh_mm}mm)"}
+
+    # Label blobs
+    structure = np.ones((3, 3), dtype=int)
+    labeled, n_blobs = ndi.label(obj_mask, structure=structure)
+
+    objects = []
+    for i in range(1, n_blobs + 1):
+        blob = labeled == i
+        n = int(blob.sum())
+        if n < min_blob_pixels:
+            continue
+        vs, us = np.where(blob)
+        depths_b = frame[blob]
+        d_mean = float(depths_b.mean())
+        d_min  = float(depths_b.min())
+        u_c, v_c = float(us.mean()), float(vs.mean())
+        x_cam = (u_c - cx) * d_mean / fx
+        y_cam = (v_c - cy) * d_mean / fy
+        elevation = desk_depth - d_mean
+        objects.append({
+            "id": i,
+            "pixels": n,
+            "center_uv": [round(u_c, 1), round(v_c, 1)],
+            "depth_mm": round(d_mean, 1),
+            "depth_top_mm": round(d_min, 1),
+            "elevation_mm": round(elevation, 1),
+            "cam_3d_mm": [round(x_cam, 1), round(y_cam, 1), round(d_mean, 1)],
+        })
+
+    # Sort by size (largest first)
+    objects.sort(key=lambda o: -o["pixels"])
+
+    return {
+        "ok": True,
+        "desk_depth_mm": round(desk_depth, 1),
+        "n_objects": len(objects),
+        "objects": objects,
+        "frame_wh": [W, H],
+        "intrinsics": {"fx": fx, "fy": fy, "cx": cx, "cy": cy},
+    }
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
