@@ -1,0 +1,89 @@
+{
+  "elbow-wave": {
+    "name": "elbow-wave",
+    "description": "Elbow wave \u2014 3 reps, default speed 20",
+    "speed": 20.0,
+    "settle_threshold": 0.5,
+    "settle_timeout": 15.0,
+    "steps": [
+      {
+        "repeat": 3,
+        "steps": [
+          {
+            "move_j": [
+              0,
+              -30,
+              90,
+              0,
+              0,
+              0
+            ],
+            "comment": "elbow up",
+            "hold": 0.2
+          },
+          {
+            "move_j": [
+              0,
+              -30,
+              140,
+              0,
+              0,
+              0
+            ],
+            "comment": "elbow down",
+            "hold": 0.2
+          }
+        ]
+      }
+    ],
+    "created_at": "2026-03-07T06:38:51Z",
+    "updated_at": "2026-03-07T06:38:51Z"
+  },
+  "home-to-rest": {
+    "name": "home-to-rest",
+    "description": "Home \u2192 Z-Home \u2192 Rest: full wind-down sequence",
+    "speed": 15.0,
+    "settle_threshold": 0.5,
+    "settle_timeout": 15.0,
+    "steps": [
+      {
+        "move_j": [
+          0,
+          0,
+          90,
+          0,
+          0,
+          0
+        ],
+        "comment": "home",
+        "hold": 1.0
+      },
+      {
+        "move_j": [
+          0,
+          -45,
+          140,
+          0,
+          0,
+          0
+        ],
+        "comment": "z-home",
+        "hold": 1.0
+      },
+      {
+        "move_j": [
+          0,
+          -73,
+          180,
+          0,
+          0,
+          0
+        ],
+        "comment": "rest",
+        "hold": 0.5
+      }
+    ],
+    "created_at": "2026-03-07T06:48:44Z",
+    "updated_at": "2026-03-07T06:48:44Z"
+  }
+}

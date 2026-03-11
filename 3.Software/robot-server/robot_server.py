@@ -26,10 +26,19 @@ import sys
 import os
 import asyncio
 import time
+import threading
+import json
+import re
+import math
+from datetime import datetime, timezone
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
+from typing import Optional
+from ik_solver import solve_ik_batch, solve_ik
 
 # ── Simulation mode flag ──────────────────────────────────────────────────────
 SIM_MODE = "--sim" in sys.argv or os.environ.get("SIM", "").lower() in ("1", "true", "yes")
@@ -57,8 +66,9 @@ _JOINT_CFG = [
     (50, -720.0,  720.0),   # J6 – wrist yaw
 ]
 
-_HOME_POSE = [0.0,   0.0, 90.0, 0.0, 0.0, 0.0]
-_REST_POSE = [0.0, -73.0, 180.0, 0.0, 0.0, 0.0]
+_HOME_POSE   = [0.0,   0.0,  90.0, 0.0, 0.0, 0.0]
+_REST_POSE   = [0.0, -73.0, 180.0, 0.0, 0.0, 0.0]
+_Z_HOME_POSE = [0.0, -45.0, 140.0, 0.0, 0.0, 0.0]  # lower arm -45°, upper arm ~horizontal
 _DEFAULT_SPEED_DEG_S = 30.0   # degrees per second
 
 
@@ -105,6 +115,11 @@ class MockJoint:
 
     def erase_configs(self):
         pass
+
+    def set_dce_kp(self, val: int): pass
+    def set_dce_kv(self, val: int): pass
+    def set_dce_ki(self, val: int): pass
+    def set_dce_kd(self, val: int): pass
 
     # ── Simulation internals ──────────────────────────────────────────────────
 
@@ -226,7 +241,109 @@ class MockDummy:
 
 # ── Global robot connection ───────────────────────────────────────────────────
 dummy = None
-_sim_task = None   # background simulation loop handle
+_sim_task = None      # background simulation loop handle
+_stop_requested: bool = False   # set by /robot/stop to interrupt play_sequence
+
+# ── Server mode ───────────────────────────────────────────────────────────────
+# high_level (default): only safe motion commands are accessible.
+# low_level: additionally exposes tuning and diagnostic commands (DCE params,
+#            raw calibration, etc.). Switch deliberately; revert when done.
+_server_mode: str = "high_level"
+
+def _check_low_level():
+    """Call at the top of any low-level-only endpoint to enforce mode gating."""
+    if _server_mode != "low_level":
+        raise HTTPException(
+            status_code=403,
+            detail="This endpoint is only available in low_level mode. "
+                   "POST /server/mode {\"mode\": \"low_level\"} to enable."
+        )
+
+# ── DCE parameter mirror ──────────────────────────────────────────────────────
+# Firmware exposes set_dce_* but no get_dce_* — we mirror values server-side.
+# Initialised to firmware defaults (kp=200, kv=80, ki=300, kd=250).
+_DCE_DEFAULTS = {"kp": 200, "kv": 80, "ki": 300, "kd": 250}
+_dce_params: dict[int, dict] = {n: dict(_DCE_DEFAULTS) for n in range(1, 7)}
+
+
+class _StopRequested(Exception):
+    """Internal signal: raised inside execute_steps when /robot/stop is called."""
+    pass
+
+
+# ── Sequence database ─────────────────────────────────────────────────────────
+_SEQ_FILE  = Path(__file__).parent / "sequences.json"
+_seq_lock  = threading.Lock()
+_sequences: dict = {}   # in-memory cache; flushed to disk on every write
+
+_SEQ_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}$')   # lowercase, hyphens, underscores
+
+# ── TCP (Tool Center Point) offset ───────────────────────────────────────────
+# When a tool is attached to J6, its tip is `_tool_length_mm` beyond the wrist.
+# move_l automatically back-calculates the required wrist position so the TOOL
+# TIP lands at the user-specified (x, y, z).  Set to 0.0 when no tool attached.
+_tool_length_mm: float = 0.0
+
+def _euler_to_rot(a_deg: float, b_deg: float, c_deg: float):
+    """
+    Build a 3×3 rotation matrix from ZYX Euler angles (degrees).
+    Convention matches firmware: a=roll(X), b=pitch(Y), c=yaw(Z).
+    Returns a flat list[9] in row-major order (same as firmware R06 layout).
+    """
+    a = math.radians(a_deg)
+    b = math.radians(b_deg)
+    c = math.radians(c_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    cb, sb = math.cos(b), math.sin(b)
+    cc, sc = math.cos(c), math.sin(c)
+    # R = Rz(c) @ Ry(b) @ Rx(a)
+    return [
+        cb*cc,          cc*sa*sb - ca*sc,   ca*cc*sb + sa*sc,
+        cb*sc,          ca*cc + sa*sb*sc,   ca*sb*sc - cc*sa,
+        -sb,            cb*sa,              ca*cb,
+    ]
+
+def _apply_tcp(x: float, y: float, z: float,
+               a: float, b: float, c: float):
+    """
+    Adjust the requested TOOL TIP position (x, y, z) to the required WRIST
+    position that the firmware IK should target.
+
+    The tool extends along the local Z-axis of J6.  In world coordinates that
+    direction is the third column of the end-effector rotation matrix R:
+        offset_world = R × [0, 0, tool_length]
+    So wrist_target = tool_tip_target - offset_world.
+    """
+    if _tool_length_mm == 0.0:
+        return x, y, z
+    R = _euler_to_rot(a, b, c)
+    # Third column of R (local Z axis in world frame) = R[2], R[5], R[8]
+    wx = x - R[2] * _tool_length_mm
+    wy = y - R[5] * _tool_length_mm
+    wz = z - R[8] * _tool_length_mm
+    return wx, wy, wz
+
+
+def _load_sequences():
+    """Load sequences from disk into _sequences cache. Called at startup."""
+    global _sequences
+    if _SEQ_FILE.exists():
+        with open(_SEQ_FILE, "r") as f:
+            _sequences = json.load(f)
+        print(f"✓  Loaded {len(_sequences)} sequence(s) from {_SEQ_FILE.name}")
+    else:
+        _sequences = {}
+        print("✓  No sequences.json found — starting with empty library.")
+
+
+def _save_sequences():
+    """Flush _sequences cache to disk. Must be called inside _seq_lock."""
+    with open(_SEQ_FILE, "w") as f:
+        json.dump(_sequences, f, indent=2)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 async def _sim_loop():
@@ -266,6 +383,10 @@ async def lifespan(app: FastAPI):
     if _sim_task is not None:
         _sim_task.cancel()
     dummy = None
+
+
+# Load sequence library on import (before first request)
+_load_sequences()
 
 
 app = FastAPI(
@@ -308,8 +429,58 @@ class MoveLBody(BaseModel):
     c: float
 
 
+class SetToolBody(BaseModel):
+    tool_length_mm: float   # distance from J6 flange to tool tip, in mm. 0 = no tool.
+
+
+class SetModeBody(BaseModel):
+    mode: str  # "high_level" or "low_level"
+
+
+class DceParamsBody(BaseModel):
+    kp: Optional[int] = None  # position error → direct output (stiffness)
+    kv: Optional[int] = None  # velocity error → integral (dynamic damping memory)
+    ki: Optional[int] = None  # position error → integral (holds against gravity)
+    kd: Optional[int] = None  # velocity error → direct output (damping)
+
+
+class MoveLPathBody(BaseModel):
+    poses: list[list[float]]  # list of [x,y,z,a,b,c] waypoints (mm + degrees)
+    step_delay_ms: float = 80.0  # milliseconds between MoveJ commands (default 80ms)
+    tcp_apply: bool = True        # apply active tool TCP offset to each waypoint
+
+
 class SpeedBody(BaseModel):
     speed: float
+
+
+class SoftMoveBody(BaseModel):
+    speed:            float = 15.0   # deg/s — default slower for safety
+    settle_threshold: float = 0.5    # degrees — "close enough" to target
+    settle_timeout:   float = 20.0   # max seconds to wait for settling
+
+
+class CreateSequenceBody(BaseModel):
+    name:             str
+    description:      str   = ""
+    speed:            float = 20.0
+    settle_threshold: float = 0.5
+    settle_timeout:   float = 15.0
+    steps:            list  # list of SequenceStep-compatible dicts
+
+
+class UpdateSequenceBody(BaseModel):
+    description:      str   | None = None
+    speed:            float | None = None
+    settle_threshold: float | None = None
+    settle_timeout:   float | None = None
+    steps:            list  | None = None   # None = keep existing steps
+
+
+class PlaySequenceOverrideBody(BaseModel):
+    speed:            float | None = None   # override saved speed
+    settle_threshold: float | None = None
+    settle_timeout:   float | None = None
 
 
 class JointPosBody(BaseModel):
@@ -332,15 +503,162 @@ def set_enable(body: EnableBody):
 
 
 @app.post("/robot/homing")
-def homing():
-    get_robot().robot.homing()
-    return {"ok": True}
+def soft_home(body: SoftMoveBody = SoftMoveBody()):
+    """
+    Soft home: moves the arm to the home pose [0, 0, 90, 0, 0, 0] using
+    move_j + settle detection. Replaces the buggy firmware homing() which
+    cannot reliably detect completion.
+
+    - Clears any previous stop flag (explicit command = intentional move).
+    - Motors are enabled automatically.
+    - Default speed: 15 °/s (safe, gentle).
+    - Waits until all joints settle within 0.5° of target (or timeout).
+    - Respects /robot/stop: exits settle loop early and returns stopped=true.
+    """
+    global _stop_requested
+    _stop_requested = False   # explicit command clears any prior stop
+
+    d = get_robot()
+    r = d.robot
+    r.set_enable(True)
+    r.set_joint_speed(body.speed)
+
+    target_phys = list(_HOME_POSE)   # [0, 0, 90, 0, 0, 0]
+    r.move_j(*target_phys)
+    target_enc = _physical_to_encoder(target_phys)
+    settle_s = _wait_for_settle(r, target_enc, body.settle_threshold, body.settle_timeout,
+                                check_stop=True)
+
+    if _stop_requested:
+        phys_now = _encoder_to_physical(_read_angles(r))
+        return {
+            "ok":        False,
+            "stopped":   True,
+            "frozen_at": [round(a, 2) for a in phys_now],
+            "settle_s":  round(settle_s, 2),
+        }
+
+    return {
+        "ok":       True,
+        "pose":     "home",
+        "target":   target_phys,
+        "angles":   [round(a, 2) for a in _encoder_to_physical(_read_angles(r))],
+        "settle_s": round(settle_s, 2),
+    }
+
+
+@app.post("/robot/z_home")
+def soft_z_home(body: SoftMoveBody = SoftMoveBody()):
+    """
+    Z-home: a natural resting pose that looks like a Z from the side.
+    Lower arm tilted back at -45° (J2), upper arm approximately horizontal (J3=140°).
+    Formula: upper arm angle from horizontal = J2 + J3 - 90°  → -45 + 140 - 90 = 5° (slightly above horizontal)
+
+    - Clears any previous stop flag (explicit command = intentional move).
+    - Motors are enabled automatically.
+    - Default speed: 15 °/s (safe, gentle).
+    - Waits until all joints settle within 0.5° of target (or timeout).
+    - Respects /robot/stop: exits settle loop early and returns stopped=true.
+    """
+    global _stop_requested
+    _stop_requested = False
+
+    d = get_robot()
+    r = d.robot
+    r.set_enable(True)
+    r.set_joint_speed(body.speed)
+
+    target_phys = list(_Z_HOME_POSE)   # [0, 0, 60, 0, 0, 0]
+    r.move_j(*target_phys)
+    target_enc = _physical_to_encoder(target_phys)
+    settle_s = _wait_for_settle(r, target_enc, body.settle_threshold, body.settle_timeout,
+                                check_stop=True)
+
+    if _stop_requested:
+        phys_now = _encoder_to_physical(_read_angles(r))
+        return {
+            "ok":        False,
+            "stopped":   True,
+            "frozen_at": [round(a, 2) for a in phys_now],
+            "settle_s":  round(settle_s, 2),
+        }
+
+    return {
+        "ok":       True,
+        "pose":     "z_home",
+        "target":   target_phys,
+        "angles":   [round(a, 2) for a in _encoder_to_physical(_read_angles(r))],
+        "settle_s": round(settle_s, 2),
+    }
 
 
 @app.post("/robot/resting")
-def resting():
-    get_robot().robot.resting()
-    return {"ok": True}
+def soft_rest(body: SoftMoveBody = SoftMoveBody()):
+    """
+    Soft rest: moves the arm to the rest/storage pose [0, -73, 180, 0, 0, 0]
+    using move_j + settle detection. Replaces the buggy firmware resting()
+    which cannot reliably detect completion.
+
+    - Clears any previous stop flag (explicit command = intentional move).
+    - Motors are enabled automatically.
+    - Default speed: 15 °/s (safe, gentle).
+    - Waits until all joints settle within 0.5° of target (or timeout).
+    - Respects /robot/stop: exits settle loop early and returns stopped=true.
+    """
+    global _stop_requested
+    _stop_requested = False   # explicit command clears any prior stop
+
+    d = get_robot()
+    r = d.robot
+    r.set_enable(True)
+    r.set_joint_speed(body.speed)
+
+    target_phys = list(_REST_POSE)   # [0, -73, 180, 0, 0, 0]
+    r.move_j(*target_phys)
+    target_enc = _physical_to_encoder(target_phys)
+    settle_s = _wait_for_settle(r, target_enc, body.settle_threshold, body.settle_timeout,
+                                check_stop=True)
+
+    if _stop_requested:
+        phys_now = _encoder_to_physical(_read_angles(r))
+        return {
+            "ok":        False,
+            "stopped":   True,
+            "frozen_at": [round(a, 2) for a in phys_now],
+            "settle_s":  round(settle_s, 2),
+        }
+
+    return {
+        "ok":       True,
+        "pose":     "rest",
+        "target":   target_phys,
+        "angles":   [round(a, 2) for a in _encoder_to_physical(_read_angles(r))],
+        "settle_s": round(settle_s, 2),
+    }
+
+
+@app.post("/robot/stop")
+def stop():
+    """
+    Freeze the arm in its current position.
+
+    - Sets a flag that interrupts any active play_sequence between steps.
+    - Re-issues the current joint angles as the new move target so the arm
+      holds its pose — motors stay ENABLED, the arm does NOT fall.
+    - Returns the frozen physical angles for logging.
+    """
+    global _stop_requested
+    _stop_requested = True
+
+    d = get_robot()
+    r = d.robot
+
+    # Read current encoder angles → convert to physical → re-send as target
+    enc_angles   = _read_angles(r)
+    phys_angles  = _encoder_to_physical(enc_angles)
+    r.move_j(*phys_angles)
+
+    return {"ok": True, "frozen_at": [round(a, 2) for a in phys_angles]}
 
 
 @app.post("/robot/move_j")
@@ -351,7 +669,23 @@ def move_j(body: MoveJBody):
 
 @app.post("/robot/move_l")
 def move_l(body: MoveLBody):
-    get_robot().robot.move_l(body.x, body.y, body.z, body.a, body.b, body.c)
+    """
+    Cartesian move to a tip position.
+    x, y, z are in MILLIMETRES (the firmware's IK solver handles mm internally).
+    a, b, c are wrist orientation in DEGREES.
+
+    If a tool is configured (POST /robot/tool), x/y/z refer to the TOOL TIP.
+    The server automatically back-calculates the required wrist position.
+
+    Returns ok=false with detail if the firmware's IK finds no valid solution.
+    """
+    r = get_robot().robot
+    # Apply TCP offset: convert tool-tip target → wrist target
+    wx, wy, wz = _apply_tcp(body.x, body.y, body.z, body.a, body.b, body.c)
+    # Firmware IK expects mm — pass directly, no conversion needed
+    result = r.move_l(wx, wy, wz, body.a, body.b, body.c)
+    if result is False:
+        return {"ok": False, "detail": "IK failed — no valid joint solution for this pose"}
     return {"ok": True}
 
 
@@ -361,10 +695,239 @@ def set_joint_speed(body: SpeedBody):
     return {"ok": True}
 
 
+# ── Tool (TCP) configuration ──────────────────────────────────────────────────
+
+@app.get("/robot/tool")
+def get_tool():
+    """Return the current tool length setting."""
+    return {
+        "tool_length_mm": _tool_length_mm,
+        "active": _tool_length_mm != 0.0,
+    }
+
+
+@app.post("/robot/tool")
+def set_tool(body: SetToolBody):
+    """
+    Set the tool length (distance from J6 flange to tool tip) in millimetres.
+    Use 0.0 to disable TCP compensation (no tool attached).
+
+    After setting this, all move_l calls will automatically target the TOOL TIP,
+    not the wrist flange.
+    """
+    global _tool_length_mm
+    if body.tool_length_mm < 0:
+        raise HTTPException(status_code=400, detail="tool_length_mm must be >= 0")
+    _tool_length_mm = body.tool_length_mm
+    return {
+        "ok": True,
+        "tool_length_mm": _tool_length_mm,
+        "active": _tool_length_mm != 0.0,
+    }
+
+
+@app.post("/robot/move_l_path")
+def move_l_path(body: MoveLPathBody):
+    """
+    Stream a Cartesian path as a rapid sequence of MoveJ commands.
+
+    Unlike move_l (which is IK + MoveJ, fire-and-forget), this endpoint:
+    1. Pre-computes IK for all waypoints in Python using the analytical solver.
+    2. Chains IK solutions so each step uses the previous solution as the
+       reference — ensures consistent elbow/shoulder configuration throughout.
+    3. Streams the resulting MoveJ commands to the arm with step_delay_ms
+       between each, allowing the PID controller to smoothly "chase" the path.
+
+    Waypoints: list of [x, y, z, a, b, c]  (mm + degrees).
+    TCP offset is applied to each waypoint if a tool is configured.
+
+    Returns: ok, steps_sent, steps_failed (IK failures skipped with a warning).
+    """
+    if not body.poses:
+        raise HTTPException(status_code=400, detail="poses list is empty")
+    for i, p in enumerate(body.poses):
+        if len(p) != 6:
+            raise HTTPException(status_code=400,
+                detail=f"pose[{i}] must have exactly 6 values, got {len(p)}")
+
+    r = get_robot().robot
+
+    # Read current joint angles to seed the IK chain
+    raw = _read_angles(r)
+    current_j = _encoder_to_physical(raw)
+
+    # Apply TCP offset to each waypoint if needed
+    poses_wrist = []
+    for p in body.poses:
+        if body.tcp_apply and _tool_length_mm > 0:
+            wx, wy, wz = _apply_tcp(p[0], p[1], p[2], p[3], p[4], p[5])
+            poses_wrist.append((wx, wy, wz, p[3], p[4], p[5]))
+        else:
+            poses_wrist.append(tuple(p))
+
+    # Batch IK — 3-4ms for 90 poses
+    solutions = solve_ik_batch(poses_wrist, start_joints=current_j)
+
+    # Stream MoveJ commands
+    sent, failed = 0, 0
+    delay_s = body.step_delay_ms / 1000.0
+    for sol in solutions:
+        if sol is None:
+            failed += 1
+            continue
+        r.move_j(*sol)
+        sent += 1
+        if delay_s > 0:
+            time.sleep(delay_s)
+
+    return {"ok": True, "steps_sent": sent, "steps_failed": failed}
+
+
 @app.post("/robot/calibrate_home_offset")
 def calibrate_home_offset():
     get_robot().robot.calibrate_home_offset()
     return {"ok": True}
+
+
+# ── Server mode ───────────────────────────────────────────────────────────────
+
+@app.get("/server/mode")
+def get_server_mode():
+    """
+    Return the current server mode.
+
+    Modes:
+      high_level (default) — safe motion commands only
+      low_level            — additionally exposes tuning and diagnostic endpoints
+    """
+    return {"mode": _server_mode}
+
+
+@app.post("/server/mode")
+def set_server_mode(body: SetModeBody):
+    """
+    Switch server mode.
+
+      POST /server/mode {"mode": "low_level"}   → enables tuning endpoints
+      POST /server/mode {"mode": "high_level"}  → re-locks them
+
+    ⚠️  Low-level mode exposes commands that can modify controller parameters.
+        Switch back to high_level when tuning is complete.
+    """
+    global _server_mode
+    if body.mode not in ("high_level", "low_level"):
+        raise HTTPException(status_code=400,
+            detail="mode must be 'high_level' or 'low_level'")
+    _server_mode = body.mode
+    return {"ok": True, "mode": _server_mode}
+
+
+# ── Per-joint DCE tuning (low-level only) ────────────────────────────────────
+
+@app.get("/robot/joint/{n}/dce")
+def get_dce(n: int):
+    """
+    Return the current (server-mirrored) DCE parameters for joint n (1–6).
+
+    Note: the firmware has no get_dce_* commands, so these values reflect
+    what was last set via POST /robot/joint/{n}/dce. On server restart they
+    reset to firmware defaults: kp=200, kv=80, ki=300, kd=250.
+
+    What each parameter does (DCE = Dynamic Control Error controller):
+      kp — position error → direct current output (stiffness / responsiveness)
+      kv — velocity error → integral accumulator (dynamic damping memory)
+      ki — position error → integral accumulator (gravity hold / steady-state)
+      kd — velocity error → direct current output (instantaneous damping)
+
+    Formula (runs at 20 kHz on STM32):
+      output_mA = (kp × pos_err + integral + kd × vel_err) / 1024
+      integral  += ki × pos_err + kv × vel_err   (per tick, clamped)
+    """
+    if n < 1 or n > 6:
+        raise HTTPException(status_code=400, detail="joint n must be 1–6")
+    return {"joint": n, **_dce_params[n]}
+
+
+@app.post("/robot/joint/{n}/dce")
+def set_dce(n: int, body: DceParamsBody):
+    """
+    Update DCE parameters for joint n (1–6). Low-level mode required.
+
+    Only the fields you supply are updated; omitted fields keep their current value.
+
+    Tuning guidelines:
+      Chattering / oscillation during motion:
+        → lower ki (less integral wind-up) and/or raise kd (more damping)
+      Sluggish / doesn't hold position under load:
+        → raise ki (more gravity hold) and/or raise kp
+      Overshoot on large moves:
+        → lower kp and/or raise kd
+
+    Safety: changes take effect immediately on the live joint. Start with
+    small adjustments (±20–50 per parameter) and test at low speed.
+    Reboot the joint board to restore firmware defaults.
+    """
+    _check_low_level()
+    if n < 1 or n > 6:
+        raise HTTPException(status_code=400, detail="joint n must be 1–6")
+
+    joint = get_joint(n)
+    updated = {}
+
+    if body.kp is not None:
+        if body.kp < 0:
+            raise HTTPException(status_code=400, detail="kp must be >= 0")
+        joint.set_dce_kp(body.kp)
+        _dce_params[n]["kp"] = body.kp
+        updated["kp"] = body.kp
+
+    if body.kv is not None:
+        if body.kv < 0:
+            raise HTTPException(status_code=400, detail="kv must be >= 0")
+        joint.set_dce_kv(body.kv)
+        _dce_params[n]["kv"] = body.kv
+        updated["kv"] = body.kv
+
+    if body.ki is not None:
+        if body.ki < 0:
+            raise HTTPException(status_code=400, detail="ki must be >= 0")
+        joint.set_dce_ki(body.ki)
+        _dce_params[n]["ki"] = body.ki
+        updated["ki"] = body.ki
+
+    if body.kd is not None:
+        if body.kd < 0:
+            raise HTTPException(status_code=400, detail="kd must be >= 0")
+        joint.set_dce_kd(body.kd)
+        _dce_params[n]["kd"] = body.kd
+        updated["kd"] = body.kd
+
+    return {
+        "ok": True,
+        "joint": n,
+        "updated": updated,
+        "current": _dce_params[n],
+    }
+
+
+@app.post("/robot/joint/{n}/dce/reset")
+def reset_dce(n: int):
+    """
+    Reset DCE parameters for joint n back to firmware defaults.
+    Low-level mode required.
+    """
+    _check_low_level()
+    if n < 1 or n > 6:
+        raise HTTPException(status_code=400, detail="joint n must be 1–6")
+
+    joint = get_joint(n)
+    joint.set_dce_kp(_DCE_DEFAULTS["kp"])
+    joint.set_dce_kv(_DCE_DEFAULTS["kv"])
+    joint.set_dce_ki(_DCE_DEFAULTS["ki"])
+    joint.set_dce_kd(_DCE_DEFAULTS["kd"])
+    _dce_params[n] = dict(_DCE_DEFAULTS)
+
+    return {"ok": True, "joint": n, "current": _dce_params[n]}
 
 
 @app.get("/robot/angles")
@@ -472,6 +1035,11 @@ def _physical_to_encoder(physical: list[float]) -> list[float]:
     """Convert physical joint angles (as used by move_j) to motor encoder angles."""
     return [physical[i] - _REST_POSE[i] for i in range(6)]
 
+
+def _encoder_to_physical(encoder: list[float]) -> list[float]:
+    """Convert motor encoder angles (0 = REST pose) back to physical joint angles."""
+    return [encoder[i] + _REST_POSE[i] for i in range(6)]
+
 class SequenceStep(BaseModel):
     # ── Move fields (for a single motion step) ───────────────────────────────
     move_j:  list[float] | None = None   # [j1,j2,j3,j4,j5,j6] degrees
@@ -502,10 +1070,12 @@ def _read_angles(r) -> list[float]:
     ]
 
 
-def _wait_for_settle(r, target: list[float], threshold: float, timeout: float) -> float:
+def _wait_for_settle(r, target: list[float], threshold: float, timeout: float,
+                     check_stop: bool = False) -> float:
     """
     Poll joint angles until all joints are within `threshold` degrees of target,
     OR until `timeout` seconds have elapsed.
+    If `check_stop=True`, also exits early when _stop_requested is set.
     Returns actual elapsed seconds.
     """
     start = time.monotonic()
@@ -513,6 +1083,8 @@ def _wait_for_settle(r, target: list[float], threshold: float, timeout: float) -
     while True:
         elapsed = time.monotonic() - start
         if elapsed >= timeout:
+            break
+        if check_stop and _stop_requested:
             break
         time.sleep(0.15)             # poll at ~6 Hz
         angles = _read_angles(r)
@@ -537,7 +1109,21 @@ def play_sequence(body: PlaySequenceBody):
 
     Blocks can be nested to any depth.
     Returns total wall-clock duration and a flat per-step log.
+
+    Call POST /robot/stop at any time to abort mid-sequence and freeze in place.
     """
+    return _run_sequence(body)
+
+
+def _run_sequence(body: PlaySequenceBody) -> dict:
+    """
+    Core sequence execution engine. Used by both play_sequence and
+    the named-sequence play endpoint.
+    Clears _stop_requested on entry. Returns a result dict.
+    """
+    global _stop_requested
+    _stop_requested = False   # clear any previous stop before we begin
+
     d = get_robot()
     r = d.robot
 
@@ -550,6 +1136,10 @@ def play_sequence(body: PlaySequenceBody):
     def execute_steps(steps: list, depth: int = 0):
         """Recursively execute steps, expanding repeat blocks."""
         for step in steps:
+            # ── Check for stop request before every step ──────────────────
+            if _stop_requested:
+                raise _StopRequested()
+
             # ── Repeat block ──────────────────────────────────────────────
             if step.repeat is not None and step.steps is not None:
                 for iteration in range(step.repeat):
@@ -576,7 +1166,12 @@ def play_sequence(body: PlaySequenceBody):
                 if len(step.move_l) != 6:
                     raise HTTPException(status_code=400,
                         detail=f"move_l must have exactly 6 values, got {len(step.move_l)}")
-                r.move_l(*step.move_l)
+                x, y, z, a, b, c = step.move_l
+                # Apply TCP offset and pass mm directly to firmware
+                wx, wy, wz = _apply_tcp(x, y, z, a, b, c)
+                r.move_l(wx, wy, wz, a, b, c)
+                time.sleep(min(body.settle_timeout, 3.0))
+                settle_s = min(body.settle_timeout, 3.0)
                 time.sleep(min(body.settle_timeout, 3.0))
                 settle_s = min(body.settle_timeout, 3.0)
 
@@ -597,7 +1192,19 @@ def play_sequence(body: PlaySequenceBody):
                 "total_s":  round(time.monotonic() - step_start, 2),
             })
 
-    execute_steps(body.steps)
+    try:
+        execute_steps(body.steps)
+    except _StopRequested:
+        enc_now  = _read_angles(r)
+        phys_now = _encoder_to_physical(enc_now)
+        return {
+            "ok":              False,
+            "stopped":         True,
+            "steps_completed": len(step_log),
+            "frozen_at":       [round(a, 2) for a in phys_now],
+            "total_s":         round(time.monotonic() - t_start, 2),
+            "step_log":        step_log,
+        }
 
     return {
         "ok":       True,
@@ -607,8 +1214,120 @@ def play_sequence(body: PlaySequenceBody):
     }
 
 
-# ── Sim-only: full state snapshot ─────────────────────────────────────────────
-@app.get("/robot/sim/state")
+# ══════════════════════════════════════════════════════════════════════════════
+# Named Sequence Library — CRUD + Play
+# Sequences are stored in sequences.json and survive server restarts.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/sequences")
+def list_sequences():
+    """List all saved sequences (summary only — no steps)."""
+    with _seq_lock:
+        return {
+            name: {
+                "description": seq.get("description", ""),
+                "step_count":  len(seq.get("steps", [])),
+                "speed":       seq.get("speed"),
+                "created_at":  seq.get("created_at"),
+                "updated_at":  seq.get("updated_at"),
+            }
+            for name, seq in _sequences.items()
+        }
+
+
+@app.post("/sequences", status_code=201)
+def create_sequence(body: CreateSequenceBody):
+    """
+    Create a new named sequence. Name must be lowercase, alphanumeric,
+    hyphens or underscores, max 64 chars. Returns 409 if name already exists.
+    """
+    if not _SEQ_NAME_RE.match(body.name):
+        raise HTTPException(status_code=400,
+            detail="Name must be lowercase alphanumeric with hyphens/underscores (e.g. 'wave', 'pick-up')")
+    with _seq_lock:
+        if body.name in _sequences:
+            raise HTTPException(status_code=409,
+                detail=f"Sequence '{body.name}' already exists — use PUT to update")
+        now = _now_iso()
+        _sequences[body.name] = {
+            "name":             body.name,
+            "description":      body.description,
+            "speed":            body.speed,
+            "settle_threshold": body.settle_threshold,
+            "settle_timeout":   body.settle_timeout,
+            "steps":            body.steps,
+            "created_at":       now,
+            "updated_at":       now,
+        }
+        _save_sequences()
+    return {"ok": True, "name": body.name, "created_at": now}
+
+
+@app.get("/sequences/{name}")
+def get_sequence(name: str):
+    """Get the full definition of a named sequence including all steps."""
+    with _seq_lock:
+        if name not in _sequences:
+            raise HTTPException(status_code=404, detail=f"Sequence '{name}' not found")
+        return _sequences[name]
+
+
+@app.put("/sequences/{name}")
+def update_sequence(name: str, body: UpdateSequenceBody):
+    """
+    Update an existing sequence. Only provided fields are changed.
+    Returns 404 if the sequence doesn't exist.
+    """
+    with _seq_lock:
+        if name not in _sequences:
+            raise HTTPException(status_code=404, detail=f"Sequence '{name}' not found")
+        seq = _sequences[name]
+        if body.description      is not None: seq["description"]      = body.description
+        if body.speed            is not None: seq["speed"]            = body.speed
+        if body.settle_threshold is not None: seq["settle_threshold"] = body.settle_threshold
+        if body.settle_timeout   is not None: seq["settle_timeout"]   = body.settle_timeout
+        if body.steps            is not None: seq["steps"]            = body.steps
+        seq["updated_at"] = _now_iso()
+        _save_sequences()
+    return {"ok": True, "name": name, "updated_at": seq["updated_at"]}
+
+
+@app.delete("/sequences/{name}")
+def delete_sequence(name: str):
+    """Delete a named sequence permanently."""
+    with _seq_lock:
+        if name not in _sequences:
+            raise HTTPException(status_code=404, detail=f"Sequence '{name}' not found")
+        del _sequences[name]
+        _save_sequences()
+    return {"ok": True, "deleted": name}
+
+
+@app.post("/sequences/{name}/play")
+def play_named_sequence(name: str, body: PlaySequenceOverrideBody = PlaySequenceOverrideBody()):
+    """
+    Play a saved sequence by name.
+    Optionally override speed / settle_threshold / settle_timeout at call time
+    without modifying the saved definition.
+    """
+    with _seq_lock:
+        if name not in _sequences:
+            raise HTTPException(status_code=404, detail=f"Sequence '{name}' not found")
+        seq = dict(_sequences[name])   # shallow copy — safe to read outside lock
+
+    # Build PlaySequenceBody from stored data, applying any runtime overrides
+    play_body = PlaySequenceBody(
+        speed            = body.speed            if body.speed            is not None else seq["speed"],
+        settle_threshold = body.settle_threshold if body.settle_threshold is not None else seq["settle_threshold"],
+        settle_timeout   = body.settle_timeout   if body.settle_timeout   is not None else seq["settle_timeout"],
+        steps            = [SequenceStep(**s) if isinstance(s, dict) else s for s in seq["steps"]],
+    )
+    result = _run_sequence(play_body)
+    result["sequence"] = name   # tag the result with the sequence name
+    return result
+
+
+# ── Sim-only: full state snapshot ─────────────────────────────────────────────@app.get("/robot/sim/state")
 def sim_state():
     """
     Returns a full snapshot of the simulated robot state.
@@ -678,6 +1397,160 @@ async def stream_angles(ws: WebSocket):
             await asyncio.sleep(0.1)   # 10 Hz
     except WebSocketDisconnect:
         pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Camera endpoints — Orbbec Astra Pro (RGB + Depth)
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from camera_manager import CameraManager
+    _camera_available = True
+except ImportError:
+    _camera_available = False
+
+
+def _get_camera() -> "CameraManager":
+    if not _camera_available:
+        raise HTTPException(status_code=503, detail="camera_manager not available")
+    return CameraManager.get()
+
+
+@app.get("/camera/rgb", tags=["Camera"],
+         summary="Capture RGB frame (JPEG)",
+         response_description="JPEG image from Astra Pro HD Camera")
+async def camera_rgb(warmup: float = 2.0):
+    """
+    Capture a single RGB frame from the Astra Pro HD Camera.
+    Returns JPEG image bytes.
+    Query param `warmup`: seconds for camera warm-up (default 2.0).
+    """
+    import asyncio
+    cm = _get_camera()
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: cm.rgb.capture_bytes(warmup_secs=warmup)
+        )
+        return Response(content=data, media_type="image/jpeg")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/camera/depth", tags=["Camera"],
+         summary="Capture depth frame (PNG)",
+         response_description="Colorized depth PNG — red=close, blue=far")
+async def camera_depth(width: int = 640, height: int = 480, fps: int = 30):
+    """
+    Capture a depth frame from the Astra Pro depth sensor.
+    Returns a colorized PNG image (red = close, blue = far).
+    Supported resolutions: 160×120, 320×240, 640×480 @ 30fps | 1280×1024 @ 7fps.
+    """
+    import asyncio
+    cm = _get_camera()
+    try:
+        data, _ = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: cm.depth.capture_bytes(width, height, fps)
+        )
+        return Response(content=data, media_type="image/png")
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/camera/depth/hires", tags=["Camera"],
+         summary="Capture hi-res depth frame 1280×1024 (PNG)",
+         response_description="Colorized depth PNG at 1280×1024 — red=close, blue=far")
+async def camera_depth_hires():
+    """
+    Capture a high-resolution depth frame (1280×1024 @ 7fps).
+    4× more detail than default 640×480. Takes ~3–4 seconds.
+    Returns colorized PNG (red = close, blue = far).
+    """
+    import asyncio
+    cm = _get_camera()
+    try:
+        data, _ = await asyncio.get_event_loop().run_in_executor(
+            None, cm.depth.capture_hires_bytes
+        )
+        return Response(content=data, media_type="image/png")
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/camera/depth/stats", tags=["Camera"],
+         summary="Depth frame stats (JSON only, no image)")
+async def camera_depth_stats(width: int = 640, height: int = 480, fps: int = 30):
+    """
+    Capture a depth frame and return statistics as JSON.
+    No image returned — faster than /camera/depth when you only need numbers.
+    Returns: width, height, valid_pixels, valid_pct, depth_min/max/p5/p95/mean in mm.
+    """
+    import asyncio, tempfile, os
+    cm = _get_camera()
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            tmp = f.name
+        try:
+            stats = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: cm.depth.capture(tmp, width, height, fps)
+            )
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return stats
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/camera/snapshot", tags=["Camera"],
+         summary="Capture RGB + depth simultaneously")
+async def camera_snapshot():
+    """
+    Capture RGB and depth frames in parallel.
+    Saves to /tmp/snapshot_rgb.jpg and /tmp/snapshot_depth.png.
+    Returns JSON with file paths, depth stats, and timestamp.
+    """
+    import asyncio
+    from datetime import datetime, timezone
+
+    cm = _get_camera()
+    rgb_path   = "/tmp/snapshot_rgb.jpg"
+    depth_path = "/tmp/snapshot_depth.png"
+
+    async def capture_rgb():
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, lambda: cm.rgb.capture(rgb_path, warmup_secs=2.0)
+        )
+
+    async def capture_depth():
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, lambda: cm.depth.capture(depth_path, 640, 480, 30)
+        )
+
+    try:
+        rgb_ok, depth_stats = await asyncio.gather(capture_rgb(), capture_depth())
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "ok":          True,
+        "rgb_path":    rgb_path,
+        "depth_path":  depth_path,
+        "rgb_ok":      rgb_ok,
+        "depth_stats": depth_stats,
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
