@@ -19,6 +19,7 @@ A living lab notebook documenting the journey of building an AI-controlled robot
 | [EXP-011](EXP-011-dce-tuning-j5-chattering.md) | DCE Tuning — J5 Chattering Fix | 2026-03-07 | ✅ Complete |
 | [EXP-012](EXP-012-running-mode.md) | Running Mode — AI-Ready Control Interface | 2026-03-07 | ✅ Complete |
 | [EXP-013](EXP-013-astra-pro-depth-camera-integration.md) | Astra Pro Depth Camera Integration | 2026-03-11 | ✅ Complete |
+| [EXP-014](EXP-014-phase2-ctypes-depth-driver.md) | Phase 2 ctypes Persistent Depth Driver + WebSocket Stream | 2026-03-11 | ✅ Complete |
 
 ## Conventions
 
