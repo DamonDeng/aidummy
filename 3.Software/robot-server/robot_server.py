@@ -403,6 +403,13 @@ app.add_middleware(
 def get_robot():
     if dummy is None:
         raise HTTPException(status_code=503, detail="Robot not connected")
+    # Verify the fibre object still has a live .robot attribute.
+    # This can go missing if USB disconnects after the server starts.
+    if not SIM_MODE and not hasattr(dummy, "robot"):
+        raise HTTPException(
+            status_code=503,
+            detail="Robot USB connection lost — please reconnect and restart the server",
+        )
     return dummy
 
 
@@ -973,12 +980,41 @@ def get_info():
 
 @app.get("/robot/status")
 def get_status():
-    """Quick health check: mode + connection status."""
-    d = get_robot()
-    return {
-        "mode": "simulation" if SIM_MODE else "physical",
-        "status": "connected" if not SIM_MODE else ("running" if d.robot.enabled else "disabled"),
-    }
+    """Quick health check: mode + connection status.
+
+    Physical mode probes the hardware: checks that the fibre object has a live
+    .robot attribute.  Returns 'connected' only when the USB link is actually up.
+    """
+    if SIM_MODE:
+        d = get_robot()
+        return {
+            "mode": "simulation",
+            "status": "running" if d.robot.enabled else "disabled",
+        }
+
+    # Physical mode: check dummy and live attribute presence
+    if dummy is None:
+        return {"mode": "physical", "status": "disconnected", "detail": "No robot found at startup"}
+
+    if not hasattr(dummy, "robot"):
+        return {
+            "mode": "physical",
+            "status": "disconnected",
+            "detail": "USB connection lost — reconnect and restart server",
+        }
+
+    # Do a lightweight live probe: read joint_1 angle (works on physical arm).
+    # RemoteObject raises AttributeError on any access when USB drops, so this
+    # reliably distinguishes "USB alive" from "USB dead".
+    try:
+        _ = dummy.robot.joint_1.angle
+        return {"mode": "physical", "status": "connected"}
+    except Exception as e:
+        return {
+            "mode": "physical",
+            "status": "disconnected",
+            "detail": f"USB probe failed: {e}",
+        }
 
 
 # ── Per-joint endpoints ───────────────────────────────────────────────────────
